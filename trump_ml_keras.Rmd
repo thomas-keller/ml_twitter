@@ -1,0 +1,433 @@
+---
+title: "ml_trump_keras"
+author: "Thomas E. Keller"
+date: "February 8, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Initial loading of trump data for cleaning
+
+
+```{r trump-clean,eval=FALSE}
+library(recipes)
+library(tidyverse)
+library(corrr)
+library(doMC)
+library(stringr)
+
+set.seed(42)
+df<-read_csv('pol_clust_trump_forml.csv')
+
+df2<-df %>%
+  select(-parsed_media_url,-parsed_media_type,-lat,-lon,-place_lat,-place_lon,-full_name,
+         -timestamp_ms,-expanded_url,-rt_screen_id,-rt_screen_name,-source,-profile_desc,
+         -profile_url,-profile_name,-id,-mentioned_users,-mentioned_id,-created_at,-user_id_str,
+         -country,-in_reply_to_user_id,-in_reply_to_screen_name,-modularity_class,
+         -strongcompnum,-att1,-hashes) %>%
+  select(class_label,everything())
+
+df2<-df2[,c(1:15,19:43)]
+names(df2)[12]<-"mod_created_at"
+
+library(stringr)
+#sent_out <- str_replace_all(df2$text,"[\n\r]",'')
+#write.csv(sent_out,'senti_text.txt',row.names=F)
+
+sent<-read_tsv('senti_text4_out.txt')
+#df2=df2[,1:37]
+df2=bind_cols(df2,sent[,1:2])
+
+df2<- df2 %>% mutate(
+  csent = Positive + Negative,
+  asent = Positive - Negative
+)
+
+screen_name<-df2$screen_name
+df2<-df2 %>%
+  select(-tweet_id,-screen_name,-text)
+
+which_nd<-function(x){n_distinct(x)>1}
+# give the column names that are univariate, so we can drop them
+names(df2)[unlist(map(df2, ~!which_nd(.)))]
+
+df3 <- df2 %>%
+  mutate(
+    used_web=used_web %>% as.numeric(),
+    used_iphone = used_iphone %>% as.numeric(),
+    used_android= used_android %>% as.numeric(),
+    prof_inlist = prof_inlist %>% as.numeric(),
+    prof_hasdesc = prof_hasdesc %>% as.numeric(),
+    rt90 = rt90 %>% as.numeric(),
+    links90 = links90 %>% as.numeric(),
+    has_ment = has_ment %>% as.numeric(),
+    has_ht = has_ht %>% as.numeric(),
+    fol2_gt_friends = fol2_gt_friends %>% as.numeric(),
+    api = api %>% as.factor() %>% as.numeric()
+  )
+
+df3 <- df3 %>%
+  select(-screen_name,-text)
+df3 <- select(df3,-datetime)
+
+
+
+
+
+df3=df2 %>%
+  mutate(
+    followers_count=followers_count +1,
+    friends_count= friends_count +1,
+    listed_count=listed_count+1,
+    statuses_count=statuses_count+1,
+    fol_rate=fol_rate+1
+  )
+
+df3=df3 %>%
+  arrange(datetime)
+
+library(rsample)
+train_test_split <- initial_split(df3, prop = 0.75)
+
+
+# Retrieve train and test sets
+train_tbl <- training(train_test_split)
+test_tbl  <- testing(train_test_split) 
+
+
+
+rec_obj=recipe(class_label~.,data=train_tbl) %>%
+  step_log(followers_count,friends_count,listed_count,statuses_count,fol_rate) %>%
+  #step_date(datetime,features='decimal') %>%
+  step_rm(datetime) %>%
+  step_sqrt(degree,indegree,outdegree) %>%
+  step_dummy(all_nominal(),-all_outcomes()) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  prep(data=train_tbl)
+
+
+
+x_train_tbl <- bake(rec_obj, newdata = train_tbl)
+x_test_tbl  <- bake(rec_obj, newdata = test_tbl)
+
+
+
+
+```
+
+
+# Using caret and glmnet for glm regression
+```{r glmnet,eval=FALSE}
+library(doParallel)
+registerDoParallel(cores=4)
+
+#myTimeControl <- trainControl(method = "timeslice",
+#                              initialWindow = 17490,
+#                              horizon = 5830,
+#                              fixedWindow = FALSE,
+#                              allowParallel = TRUE),
+#                              seeds = seeds)
+
+fitControl <- trainControl(method = "CV",
+                           number = 5,
+                           verboseIter = TRUE,
+                           summaryFunction = multiClassSummary,
+                           allowParallel=TRUE,
+                           classProbs=TRUE
+                           
+                          )
+
+save.image('feb0818.Rdata')
+
+#glmmod <- train(x_train_tbl[,names(x_train_tbl)!="class_label"], x_train_tbl$class_label, method='glmnet',metric='accuracy', trControl=fitControl)
+
+glmmod2 <- train(x_train_tbl[,names(x_train_tbl)!="class_label"], x_train_tbl$class_label, method='glmnet',metric='accuracy', trControl=fitControl)
+
+
+glm_pred <- predict(glmmod2, newdata = x_test_tbl)
+confusionMatrix(glm_pred,x_test_tbl$class_label)
+
+
+```
+
+# Sentiment analysis part
+
+```{r sent,eval=FALSE}
+
+#explainer <- lime::lime(iris_train, model)
+dftext=read_csv('texts60_forsent_scored.csv')
+
+mae_pos=abs(dftext$hand_pos_tek-dftext$Positive)
+mae_neg=abs(dftext$hand_neg_tek-dftext$Negative)
+
+mae_pfac=as.factor(dftext$hand_pos_tek)==as.factor(dftext$Positive)
+mae_nfac=as.factor(dftext$hand_neg_tek)==as.factor(dftext$Negative)
+
+mae_cb=mae_pfac & mae_nfac
+
+
+# Explain new observation
+explanation <- lime::explain(iris_test, explainer, n_labels = 1, n_feat ures = 2)
+
+library(purrr)
+library(ggplot2)
+
+hrm=bake(rec_obj,newdata=df3)
+hrm=hrm[,c(1,36:39)]
+hrm=cbind(hrm,datetime=df$datetime)
+
+library(cowplot)
+p=hrm %>%
+  gather(key,value,-datetime,-class_label) %>%
+  ggplot(aes(datetime,value)) +
+  facet_grid(class_label~ key, scales = "free") +
+    geom_smooth()+theme(axis.text.x=element_text(angle=315,vjust=0.6))
+save_plot("sentiment_line.png",p)
+
+p=hrm %>%
+  gather(key,value,-datetime,-class_label) %>%
+  ggplot(aes(class_label,value)) +
+  facet_grid(.~key, scales = "free") +
+    geom_boxplot() +theme(axis.text.x=element_text(angle=315,vjust=0.6)) 
+
+save_plot("sentiment_boxplot.png")
+  
+
+```
+
+## subsample for hand-labeling
+
+```{r subsample,eval=FALSE}
+library(dplyr)
+bigdf <- bind_cols(df,sent[,1:2])
+
+
+bigdf <- bigdf %>% mutate(
+  csent = Positive + Negative,
+  asent = Positive - Negative
+)
+
+dfsub=bigdf %>% group_by(class_label) %>% sample_n(20)
+
+```
+
+# keras neural net!!
+```{r keras}
+library(keras)
+library(stringr)
+
+library(caret)
+
+
+
+#this monstrous regex I don't even comprehend but it's from David Robinson & Julia Silge's
+# wonderful book tidytext online at https://www.tidytextmining.com/twitter.html
+dfk=df
+replace_reg <- "https://t.co/[A-Za-z\\d]+|http://[A-Za-z\\d]+|<[A-Za-z\\d]+>|&amp;|&lt;|&gt;|RT|https"
+dfk$text=str_replace_all(dfk$text,replace_reg,"")
+dfk$text=str_replace_all(dfk$text,"[\n\r]"," ")
+
+
+inA <- createDataPartition(dfk$class_label, list = FALSE,p=0.75)
+
+#train_test_split <- initial_split(dfk, prop = 0.75)
+#don't use rsplit with text data I think
+
+# Retrieve train and test sets
+#train_tbl <- training(train_test_split)
+#test_tbl  <- testing(train_test_split) 
+train_tbl=dfk[inA,]
+test_tbl=dfk[-inA,]
+
+
+x_train=train_tbl$text
+x_test=test_tbl$text
+
+#factors start at 1, to_categorical wants them to start at 0
+y_train=train_tbl$class_label %>% as.factor() %>% as.numeric() - 1 
+y_test=test_tbl$class_label %>% as.factor() %>% as.numeric() - 1
+
+y_train_vec=to_categorical(y_train)
+y_test_vec=to_categorical(y_test)
+
+
+library(keras)
+
+max_words <- 20000
+batch_size <- 128
+epochs <- 10
+maxlen <- 75
+dropout <- 0.2
+filters <- 250
+kernel_size <- 5
+pool_size <- 4
+hidden_dims <- 512
+cat(length(x_train), 'train sequences\n')
+cat(length(x_test), 'test sequences\n')
+
+#num_classes <- max(y_train) + 1
+cat(num_classes, '\n')
+
+cat('Vectorizing sequence data...\n')
+
+tokenizer <- text_tokenizer(num_words = max_words,
+                            filter='!"#$%&()*+,-./:;<=>?@[\\]^_`{|}~\t\n0123456789')
+tokenizer <-fit_text_tokenizer(tokenizer,dfk$text)
+
+data <- texts_to_sequences(tokenizer, dfk$text)
+x_train <-data[inA]
+x_test <-data[-inA]
+
+x_train_vec <- pad_sequences( x_train,maxlen=maxlen)
+x_test_vec <-pad_sequences(x_test,maxlen=maxlen)
+
+cat('x_train shape:', dim(x_train), '\n')
+cat('x_test shape:', dim(x_test), '\n')
+
+cat('Convert class vector to binary class matrix',
+    '(for use with categorical_crossentropy)\n')
+
+#factors start at 1, to_categorical wants them to start at 0
+y_train=train_tbl$class_label %>% as.factor() %>% as.numeric() - 1 
+y_test=test_tbl$class_label %>% as.factor() %>% as.numeric() - 1
+
+y_train_vec=to_categorical(y_train)
+y_test_vec=to_categorical(y_test)
+cat('y_train shape:', dim(y_train), '\n')
+cat('y_test shape:', dim(y_test), '\n')
+
+num_classes=length(unique(y_train))
+
+cat('Building model...\n')
+model <- keras_model_sequential()
+model %>%
+  layer_embedding(input_dim=max_words, output_dim = 128,input_length=maxlen) %>% 
+  layer_dropout(dropout) %>%
+  layer_conv_1d(
+    filters, kernel_size,
+    padding = "valid", activation ="relu", strides= 1
+  ) %>%
+  layer_max_pooling_1d(pool_size) %>%
+  
+  layer_conv_1d(
+    filters, kernel_size,
+    padding = "valid", activation ="relu", strides= 1
+  ) %>%
+  layer_global_max_pooling_1d() %>%
+  
+  #layer_dense(hidden_dims) %>%
+  #layer_dropout(dropout) %>%
+  #layer_lstm(units= 64, dropout = 0.2, recurrent_dropout = 0.2) %>% 
+  #layer_dense(units = num_classes) %>%
+  layer_activation("relu") %>%
+  layer_dense(units = num_classes) %>%
+
+  layer_activation(activation = 'softmax')
+
+model %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = 'adam',
+  metrics = c('accuracy')
+)
+
+history <- model %>% fit(
+  x_train_vec, y_train_vec,
+  batch_size = batch_size,
+  epochs = epochs,
+  verbose = 1,
+  validation_split = 0.2
+)
+
+score <- model %>% evaluate(
+  x_test_vec, y_test_vec,
+  batch_size = batch_size,
+  verbose = 1
+)
+
+
+
+
+
+
+
+
+
+#reuters example
+###############
+#left here to see how I minimally changed from reuters
+library(keras)
+
+max_words <- 1000
+batch_size <- 32
+epochs <- 10
+
+cat('Loading data...\n')
+reuters <- dataset_reuters(num_words = max_words, test_split = 0.2)
+x_train <- reuters$train$x
+y_train <- reuters$train$y
+x_test <- reuters$tesxt$x
+y_test <- reuters$test$y
+
+cat(length(x_train), 'train sequences\n')
+cat(length(x_test), 'test sequences\n')
+
+num_classes <- max(y_train) + 1
+cat(num_classes, '\n')
+
+cat('Vectorizing sequence data...\n')
+
+tokenizer <- text_tokenizer(num_words = max_words)
+x_train <- sequences_to_matrix(tokenizer, x_train, mode = 'binary')
+x_test <- sequences_to_matrix(tokenizer, x_test, mode = 'binary')
+
+cat('x_train shape:', dim(x_train), '\n')
+cat('x_test shape:', dim(x_test), '\n')
+
+cat('Convert class vector to binary class matrix',
+    '(for use with categorical_crossentropy)\n')
+y_train <- to_categorical(y_train, num_classes)
+y_test <- to_categorical(y_test, num_classes)
+cat('y_train shape:', dim(y_train), '\n')
+cat('y_test shape:', dim(y_test), '\n')
+
+cat('Building model...\n')
+model <- keras_model_sequential()
+model %>%
+  layer_dense(units = 512, input_shape = c(max_words)) %>% 
+  layer_activation(activation = 'relu') %>% 
+  layer_dropout(rate = 0.5) %>% 
+  layer_dense(units = num_classes) %>% 
+  layer_activation(activation = 'softmax')
+
+model %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = 'adam',
+  metrics = c('accuracy')
+)
+
+history <- model %>% fit(
+  x_train, y_train,
+  batch_size = batch_size,
+  epochs = epochs,
+  verbose = 1,
+  validation_split = 0.1
+)
+
+score <- model %>% evaluate(
+  x_test, y_test,
+  batch_size = batch_size,
+  verbose = 1
+)
+
+cat('Test score:', score[[1]], '\n')
+cat('Test accuracy', score[[2]], '\n')
+
+
+
+
+```
+
