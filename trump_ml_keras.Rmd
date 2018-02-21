@@ -302,6 +302,11 @@ cat('y_test shape:', dim(y_test), '\n')
 
 num_classes=length(unique(y_train))
 
+
+# These steps are similar whenever you see the base interface to keras
+# basically, stacking layers of a model like a cake on top of one another
+
+
 cat('Building model...\n')
 model <- keras_model_sequential()
 model %>%
@@ -328,11 +333,17 @@ model %>%
 
   layer_activation(activation = 'softmax')
 
+
+#### compile model
+
 model %>% compile(
   loss = 'categorical_crossentropy',
   optimizer = 'adam',
   metrics = c('accuracy')
 )
+
+
+#### Run model
 
 history <- model %>% fit(
   x_train_vec, y_train_vec,
@@ -341,6 +352,8 @@ history <- model %>% fit(
   verbose = 1,
   validation_split = 0.2
 )
+
+### Run stats on the test (holdout) data
 
 score <- model %>% evaluate(
   x_test_vec, y_test_vec,
